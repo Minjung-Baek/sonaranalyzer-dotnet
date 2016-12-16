@@ -27,6 +27,7 @@ using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.Diagnostics;
 using SonarAnalyzer.Common;
 using SonarAnalyzer.Helpers;
+using System;
 
 namespace SonarAnalyzer.Rules.CSharp
 {
@@ -76,9 +77,11 @@ namespace SonarAnalyzer.Rules.CSharp
                     var usedSymbols = new HashSet<ISymbol>();
                     var emptyConstructors = new HashSet<ISymbol>();
 
-                    CollectUsedSymbols(declarationCollector, usedSymbols, declaredPrivateSymbols);
+                    var propertyAccessorAccess = new Dictionary<IPropertySymbol, AccessorAccess>();
+
+                    CollectUsedSymbols(declarationCollector, usedSymbols, declaredPrivateSymbols, propertyAccessorAccess);
                     CollectUsedSymbolsFromCtorInitializerAndCollectEmptyCtors(declarationCollector,
-                        usedSymbols, emptyConstructors);
+                        usedSymbols, emptyConstructors, propertyAccessorAccess);
 
                     ReportIssues(c, usedSymbols, declaredPrivateSymbols, emptyConstructors, fieldLikeSymbols);
                 },
@@ -204,7 +207,8 @@ namespace SonarAnalyzer.Rules.CSharp
 
         private static void CollectUsedSymbolsFromCtorInitializerAndCollectEmptyCtors(
             RemovableDeclarationCollector declarationCollector,
-            HashSet<ISymbol> usedSymbols, HashSet<ISymbol> emptyConstructors)
+            HashSet<ISymbol> usedSymbols, HashSet<ISymbol> emptyConstructors,
+            Dictionary<IPropertySymbol, AccessorAccess> propertyAccessorAccess)
         {
             var ctors = declarationCollector.TypeDeclarations
                 .SelectMany(container => container.SyntaxNode.DescendantNodes(RemovableDeclarationCollector.IsNodeStructOrClassDeclaration)
@@ -239,7 +243,8 @@ namespace SonarAnalyzer.Rules.CSharp
         }
 
         private static void CollectUsedSymbols(RemovableDeclarationCollector declarationCollector,
-            HashSet<ISymbol> usedSymbols, HashSet<ISymbol> declaredPrivateSymbols)
+            HashSet<ISymbol> usedSymbols, HashSet<ISymbol> declaredPrivateSymbols,
+            Dictionary<IPropertySymbol, AccessorAccess> propertyAccessorAccess)
         {
             var symbolNames = declaredPrivateSymbols.Select(s => s.Name).ToImmutableHashSet();
             var anyRemovableIndexers = declaredPrivateSymbols
@@ -251,12 +256,11 @@ namespace SonarAnalyzer.Rules.CSharp
 
             var identifiers = declarationCollector.TypeDeclarations
                 .SelectMany(container => container.SyntaxNode.DescendantNodes()
-                    .Where(node =>
-                        node.IsKind(SyntaxKind.IdentifierName))
+                    .Where(node => node.IsKind(SyntaxKind.IdentifierName))
                     .Cast<IdentifierNameSyntax>()
                     .Where(node => symbolNames.Contains(node.Identifier.ValueText))
                     .Select(node =>
-                        new SyntaxNodeSemanticModelTuple<SyntaxNode>
+                        new SyntaxNodeSemanticModelTuple<ExpressionSyntax>
                         {
                             SyntaxNode = node,
                             SemanticModel = container.SemanticModel
@@ -264,12 +268,11 @@ namespace SonarAnalyzer.Rules.CSharp
 
             var generic = declarationCollector.TypeDeclarations
                 .SelectMany(container => container.SyntaxNode.DescendantNodes()
-                    .Where(node =>
-                        node.IsKind(SyntaxKind.GenericName))
+                    .Where(node => node.IsKind(SyntaxKind.GenericName))
                     .Cast<GenericNameSyntax>()
                     .Where(node => symbolNames.Contains(node.Identifier.ValueText))
                     .Select(node =>
-                        new SyntaxNodeSemanticModelTuple<SyntaxNode>
+                        new SyntaxNodeSemanticModelTuple<ExpressionSyntax>
                         {
                             SyntaxNode = node,
                             SemanticModel = container.SemanticModel
@@ -282,8 +285,9 @@ namespace SonarAnalyzer.Rules.CSharp
                 var nodes = declarationCollector.TypeDeclarations
                     .SelectMany(container => container.SyntaxNode.DescendantNodes()
                         .Where(node => node.IsKind(SyntaxKind.ElementAccessExpression))
+                        .Cast<ElementAccessExpressionSyntax>()
                         .Select(node =>
-                            new SyntaxNodeSemanticModelTuple<SyntaxNode>
+                            new SyntaxNodeSemanticModelTuple<ExpressionSyntax>
                             {
                                 SyntaxNode = node,
                                 SemanticModel = container.SemanticModel
@@ -297,8 +301,9 @@ namespace SonarAnalyzer.Rules.CSharp
                 var nodes = declarationCollector.TypeDeclarations
                     .SelectMany(container => container.SyntaxNode.DescendantNodes()
                         .Where(node => node.IsKind(SyntaxKind.ObjectCreationExpression))
+                        .Cast<ObjectCreationExpressionSyntax>()
                         .Select(node =>
-                            new SyntaxNodeSemanticModelTuple<SyntaxNode>
+                            new SyntaxNodeSemanticModelTuple<ExpressionSyntax>
                             {
                                 SyntaxNode = node,
                                 SemanticModel = container.SemanticModel
@@ -308,12 +313,68 @@ namespace SonarAnalyzer.Rules.CSharp
             }
 
             var candidateSymbols = allNodes
-                .Select(n => n.SemanticModel.GetSymbolInfo(n.SyntaxNode))
-                .SelectMany(s => GetAllCandidateSymbols(s))
-                .Select(s => GetOriginalSymbol(s))
-                .Where(s => s != null);
+                .Select(n => new { Syntax = n.SyntaxNode, SemanticModel = n.SemanticModel, Symbol = n.SemanticModel.GetSymbolInfo(n.SyntaxNode) })
+                .Select(n => new
+                {
+                    Syntax = n.Syntax,
+                    SemanticModel = n.SemanticModel,
+                    Symbols = GetAllCandidateSymbols(n.Symbol)
+                        .Select(s => GetOriginalSymbol(s))
+                        .Where(s => s != null)
+                });
 
-            usedSymbols.UnionWith(candidateSymbols);
+            foreach (var candidateSymbol in candidateSymbols)
+            {
+                usedSymbols.UnionWith(candidateSymbol.Symbols);
+
+                var accessorKind = GetAccessorAccessKind(candidateSymbol.Syntax, candidateSymbol.SemanticModel);
+
+                foreach (var propertySymbol in candidateSymbol.Symbols.OfType<IPropertySymbol>())
+                {
+                    if (propertyAccessorAccess.ContainsKey(propertySymbol))
+                    {
+                        propertyAccessorAccess[propertySymbol] |= accessorKind;
+                    }
+                    else
+                    {
+                        propertyAccessorAccess[propertySymbol] = accessorKind;
+                    }
+                }
+            }
+        }
+
+        private static AccessorAccess GetAccessorAccessKind(ExpressionSyntax expression, SemanticModel semanticModel)
+        {
+            var accessExpression = expression.GetSelfOrTopParenthesizedExpression();
+            var parentKind = accessExpression.Parent.Kind();
+            if (parentKind == SyntaxKind.SimpleAssignmentExpression)
+            {
+                return AccessorAccess.Set;
+            }
+
+            if (accessExpression.Parent is AssignmentExpressionSyntax ||
+                IncrementKinds.Contains(parentKind) ||
+                accessExpression.IsInNameofCall(semanticModel))
+            {
+                return AccessorAccess.Both;
+            }
+
+            return AccessorAccess.Get;
+        }
+
+        private static readonly ISet<SyntaxKind> IncrementKinds = ImmutableHashSet.Create(
+            SyntaxKind.PostIncrementExpression,
+            SyntaxKind.PreIncrementExpression,
+            SyntaxKind.PostDecrementExpression,
+            SyntaxKind.PreDecrementExpression);
+
+        [Flags]
+        private enum AccessorAccess
+        {
+            None = 0,
+            Get = 1,
+            Set = 2,
+            Both = Get | Set
         }
 
         private static ISymbol GetOriginalSymbol(ISymbol candidateSymbol)
